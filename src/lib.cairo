@@ -1,38 +1,66 @@
+// SPDX-License-Identifier: MIT
+
+use starknet::ContractAddress;
+use core::traits::TryInto; 
+// use core::zeroable::Zeroable
+use core::num::traits::Zero;
+
+
+
 #[starknet::interface]
 pub trait IAuctionSystem<TContractState> {
     fn create_auction(ref self: TContractState, nft_id: u256, start_price: u256, auction_duration: u64);
     fn place_bid(ref self: TContractState, nft_id: u256, bid_amount: u256);
     fn end_auction(ref self: TContractState, nft_id: u256);
-    fn get_current_highest_bid(self: @TContractState, nft_id: u256) -> (felt252, u256);
+    fn get_current_highest_bid(self: @TContractState, nft_id: u256) -> (ContractAddress, felt252);
     fn withdraw_bid(ref self: TContractState, nft_id: u256);
+    fn pause(ref self: TContractState);
+    fn unpause(ref self: TContractState);
 }
 
 #[starknet::contract]
 mod AuctionSystem {
+    use core::num::traits::Zero;
+    use openzeppelin::access::ownable::OwnableComponent; 
+    use openzeppelin::security::pausable::PausableComponent;
+    
     use starknet::ContractAddress;
     use starknet::get_caller_address;
     use starknet::get_block_timestamp;
-    use core::array::ArrayTrait;
-    use core::traits::TryInto;
-    use core::option::OptionTrait;
-    use core::num::traits::Zero;
+
+
+    // Declare the components
+    component!(path: PausableComponent, storage: pausable, event: PausableEvent);
+    component!(path: OwnableComponent, storage: ownable, event: OwnableEvent);
+
+    // Instantiate `InternalImpl` to give the contract access to the `initializer`
+    impl InternalImpl = OwnableComponent::InternalImpl<ContractState>;
+
+    // Pausable integration
+    #[abi(embed_v0)]
+    impl PausableImpl = PausableComponent::PausableImpl<ContractState>;
+    impl PausableInternalImpl = PausableComponent::InternalImpl<ContractState>;
+
+    // Ownable integration
+    #[abi(embed_v0)]
+    impl OwnableImpl = OwnableComponent::OwnableImpl<ContractState>;
+    impl OwnableInternalImpl = OwnableComponent::InternalImpl<ContractState>;
 
     #[storage]
     struct Storage {
-        // Auction start price
-        auction_start_price: LegacyMap::<u256, u256>,
-        // Auction highest bid
-        auction_highest_bid: LegacyMap::<u256, u256>,
-        // Auction start timestamp
-        auction_start_time: LegacyMap::<u256, u64>,
-        // Auction duration
-        auction_duration: LegacyMap::<u256, u64>,
-        // Auction active status
-        auction_is_active: LegacyMap::<u256, bool>,
-        // Bids for each NFT and bidder
-        bids: LegacyMap::<(u256, felt252), u256>,
-        // Track highest bidder for each NFT
-        highest_bidders: LegacyMap::<u256, felt252>
+        auction_start_price: starknet::storage::Map::<u256, u256>,
+        auction_highest_bid: starknet::storage::Map::<u256, u256>,
+        auction_start_time: starknet::storage::Map::<u256, u64>,
+        auction_duration: starknet::storage::Map::<u256, u64>,
+        auction_is_active: starknet::storage::Map::<u256, bool>,
+        bids: starknet::storage::Map::<(u256, ContractAddress), u256>,
+        highest_bidders: starknet::storage::Map::<u256, ContractAddress>,
+        
+        #[substorage(v0)]
+        pausable: PausableComponent::Storage,
+        
+        #[substorage(v0)]
+        ownable: OwnableComponent::Storage
     }
 
     #[event]
@@ -41,7 +69,13 @@ mod AuctionSystem {
         AuctionCreated: AuctionCreated,
         BidPlaced: BidPlaced,
         AuctionEnded: AuctionEnded,
-        BidWithdrawn: BidWithdrawn
+        BidWithdrawn: BidWithdrawn,
+        
+        #[flat]
+        PausableEvent: PausableComponent::Event,
+        
+        #[flat]
+        OwnableEvent: OwnableComponent::Event
     }
 
     #[derive(Drop, starknet::Event)]
@@ -54,35 +88,40 @@ mod AuctionSystem {
     #[derive(Drop, starknet::Event)]
     struct BidPlaced {
         nft_id: u256,
-        bidder: felt252,
+        bidder: ContractAddress,
         bid_amount: u256
     }
 
     #[derive(Drop, starknet::Event)]
     struct AuctionEnded {
         nft_id: u256,
-        winner: felt252,
+        winner: ContractAddress,
         winning_bid: u256
     }
 
     #[derive(Drop, starknet::Event)]
     struct BidWithdrawn {
         nft_id: u256,
-        bidder: felt252,
+        bidder: ContractAddress,
         bid_amount: u256
+    }
+
+    #[constructor]
+    fn constructor(ref self: ContractState, owner: ContractAddress) {
+        self.ownable.initializer(owner);
+        self.pausable.pause();  // Use pause() instead of init()
     }
 
     #[abi(embed_v0)]
     impl AuctionSystemImpl of super::IAuctionSystem<ContractState> {
         fn create_auction(ref self: ContractState, nft_id: u256, start_price: u256, auction_duration: u64) {
-            // Get caller address
-            let caller: felt252 = get_caller_address().try_into().unwrap();
+            self.pausable.assert_not_paused();
             
-            // Validate inputs
+            // Remove unused caller variable
+            
             assert(auction_duration > 0, 'Invalid auction duration');
             assert(start_price > 0, 'Start price must be positive');
             
-            // Store auction details
             let current_timestamp = get_block_timestamp();
             self.auction_start_price.write(nft_id, start_price);
             self.auction_highest_bid.write(nft_id, start_price);
@@ -90,7 +129,6 @@ mod AuctionSystem {
             self.auction_duration.write(nft_id, auction_duration);
             self.auction_is_active.write(nft_id, true);
             
-            // Emit event
             self.emit(Event::AuctionCreated(AuctionCreated { 
                 nft_id, 
                 start_price, 
@@ -98,40 +136,33 @@ mod AuctionSystem {
             }));
         }
 
+       
+
         fn place_bid(ref self: ContractState, nft_id: u256, bid_amount: u256) {
-            // Get caller address
-            let caller: felt252 = get_caller_address().try_into().unwrap();
+            self.pausable.assert_not_paused();
             
-            // Check auction is active
+            let caller = get_caller_address();
+            
             assert(self.auction_is_active.read(nft_id), 'Auction is not active');
             
-            // Check current timestamp
             let current_timestamp = get_block_timestamp();
             let auction_start = self.auction_start_time.read(nft_id);
             let auction_length = self.auction_duration.read(nft_id);
             assert(current_timestamp < auction_start + auction_length, 'Auction has ended');
             
-            // Validate bid
             let current_highest_bid = self.auction_highest_bid.read(nft_id);
             assert(bid_amount > current_highest_bid, 'Bid too low');
             
-            // Refund previous highest bidder
             let previous_highest_bidder = self.highest_bidders.read(nft_id);
-            if previous_highest_bidder != 0 {
-                let previous_highest_bid = self.bids.read((nft_id, previous_highest_bidder));
+            if !previous_highest_bidder.is_zero() {
+                let _previous_highest_bid = self.bids.read((nft_id, previous_highest_bidder));
                 self.bids.write((nft_id, previous_highest_bidder), 0);
-            }
+            } 
             
-            // Store new bid
             self.bids.write((nft_id, caller), bid_amount);
-            
-            // Update auction details
             self.auction_highest_bid.write(nft_id, bid_amount);
-            
-            // Update highest bidder
             self.highest_bidders.write(nft_id, caller);
             
-            // Emit event
             self.emit(Event::BidPlaced(BidPlaced { 
                 nft_id, 
                 bidder: caller, 
@@ -140,22 +171,18 @@ mod AuctionSystem {
         }
 
         fn end_auction(ref self: ContractState, nft_id: u256) {
-            // Check auction is active
+            self.pausable.assert_not_paused();
+            
             assert(self.auction_is_active.read(nft_id), 'Auction already ended');
             
-            // Check auction has ended
             let current_timestamp = get_block_timestamp();
             let auction_start = self.auction_start_time.read(nft_id);
             let auction_length = self.auction_duration.read(nft_id);
             assert(current_timestamp >= auction_start + auction_length, 'Auction not yet ended');
             
-            // Get highest bidder
             let winner = self.highest_bidders.read(nft_id);
-            
-            // Mark auction as inactive
             self.auction_is_active.write(nft_id, false);
             
-            // Emit event
             self.emit(Event::AuctionEnded(AuctionEnded { 
                 nft_id, 
                 winner, 
@@ -163,35 +190,42 @@ mod AuctionSystem {
             }));
         }
 
-        fn get_current_highest_bid(self: @ContractState, nft_id: u256) -> (felt252, u256) {
-            // Get highest bidder and bid amount
+        fn get_current_highest_bid(self: @ContractState, nft_id: u256) -> (ContractAddress, felt252) {
             let highest_bidder = self.highest_bidders.read(nft_id);
             let highest_bid = self.bids.read((nft_id, highest_bidder));
             
-            (highest_bidder, highest_bid)
+            (highest_bidder, highest_bid.try_into().unwrap()) 
         }
 
         fn withdraw_bid(ref self: ContractState, nft_id: u256) {
-            // Get caller address
-            let caller: felt252 = get_caller_address().try_into().unwrap();
+            self.pausable.assert_not_paused();
             
-            // Get user's bid
+            let caller = get_caller_address();
+            
             let bid_amount = self.bids.read((nft_id, caller));
             assert(bid_amount > 0, 'No bid to withdraw');
             
-            // Check they are not the highest bidder
             let highest_bidder = self.highest_bidders.read(nft_id);
             assert(caller != highest_bidder, 'Cannot withdraw highest bid');
             
-            // Clear bid
             self.bids.write((nft_id, caller), 0);
             
-            // Emit event
             self.emit(Event::BidWithdrawn(BidWithdrawn { 
                 nft_id, 
                 bidder: caller, 
                 bid_amount 
             }));
+        }
+
+        // Owner-only pause/unpause functions
+        fn pause(ref self: ContractState) {
+            self.ownable.assert_only_owner();
+            self.pausable.pause();
+        }
+
+        fn unpause(ref self: ContractState) {
+            self.ownable.assert_only_owner();
+            self.pausable.unpause();
         }
     }
 }

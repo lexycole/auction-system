@@ -44,13 +44,7 @@ const Header = () => {
       <header className="rounded-[12px] bg-primary-gradient md:rounded-[32px]">
         <div className="mx-auto flex h-16 max-w-[--header-max-w] items-center justify-between px-4 md:h-28 md:px-8">
           <div className="hidden w-[18.75rem] md:block">
-            <Link href={"/"}>
-              <img
-                src="/assets/logo.png"
-                alt="logo"
-                className="h-full w-full"
-              />
-            </Link>
+              <h2 className="text-[24px] text-white">NFT Auction System</h2>
           </div>
 
           <Link href={"/"} className="block h-[35px] w-[35px] md:hidden">
